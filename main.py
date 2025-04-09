@@ -1,19 +1,17 @@
 import discord
 from discord.ext import commands
-from discord.ext.voice_recv import VoiceRecvClient, AudioSink
-import whisper
-from transformers import pipeline
 import asyncio
 import wave
 import os
 from datetime import datetime
-from security import token
+import whisper
+from transformers import pipeline
 
-# ====== НАСТРОЙКИ ======
-TOKEN = token
+import security
+
+TOKEN = security.token
 GUILD_ID = 1333447583947034705
 
-# ====== НАЧАЛО БОТА ======
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
@@ -21,141 +19,108 @@ intents.guilds = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree  # для slash-команд
 
-# ====== МОДЕЛИ ======
 whisper_model = whisper.load_model("base")
-summarizer = pipeline("summarization", model="t5-small", tokenizer="t5-small")
+summarizer = pipeline("summarization", model="t5-small")
 
+@bot.event
+async def on_ready():
+    print(f"Бот запущен как {bot.user}")
 
-from discord.ext.voice_recv import AudioSink
+@bot.command(name="join")
+async def join(ctx):
+    if ctx.author.voice:
+        channel = ctx.author.voice.channel
+        await channel.connect()
+        await ctx.send("✅ Подключился к голосовому каналу.")
+    else:
+        await ctx.send("❌ Вы не находитесь в голосовом канале.")
 
-class RecordingSink(AudioSink):
-    def __init__(self):
-        self.audio_data = {}
-
-    def write(self, user, data):
-        if user.id not in self.audio_data:
-            self.audio_data[user.id] = {"name": user.display_name, "frames": []}
-        self.audio_data[user.id]["frames"].append(data)
-
-    def save_to_wav(self):
-        import os, wave
-        from datetime import datetime
-
-        os.makedirs("recordings", exist_ok=True)
-        files = []
-        for uid, info in self.audio_data.items():
-            frames = b"".join(info["frames"])
-            filename = f"recordings/{info['name']}_{uid}_{datetime.now().strftime('%H%M%S')}.wav"
-            with wave.open(filename, "wb") as wf:
-                wf.setnchannels(2)
-                wf.setsampwidth(2)
-                wf.setframerate(48000)
-                wf.writeframes(frames)
-            files.append((info['name'], filename))
-        return files
-
-    # 🚨 Обязательные методы
-    def wants_opus(self) -> bool:
-        # Мы хотим PCM, а не Opus, чтобы Whisper мог обрабатывать
-        return False
-
-    def cleanup(self):
-        # Если нужно что-то убрать после stop_listening — сюда
-        pass
-
-
-# ====== СИНК ДЛЯ ЗАПИСИ ======
-class RecordingSink(AudioSink):
-    def __init__(self):
-        self.audio_data = {}
-
-    def write(self, user, data):
-        if user.id not in self.audio_data:
-            self.audio_data[user.id] = {"name": user.display_name, "frames": []}
-        self.audio_data[user.id]["frames"].append(data)
-
-    def save_to_wav(self):
-        os.makedirs("recordings", exist_ok=True)
-        files = []
-        for uid, info in self.audio_data.items():
-            frames = b"".join(info["frames"])
-            filename = f"recordings/{info['name']}_{uid}_{datetime.now().strftime('%H%M%S')}.wav"
-            with wave.open(filename, "wb") as wf:
-                wf.setnchannels(2)
-                wf.setsampwidth(2)
-                wf.setframerate(48000)
-                wf.writeframes(frames)
-            files.append((info['name'], filename))
-        return files
-
-# ====== ОБРАБОТКА РАСПОЗНАВАНИЯ ======
-async def process_audio_and_respond(interaction, files):
-    full_text = ""
-
-    for username, filename in files:
-        await interaction.followup.send(f"🔍 Распознаю голос {username}...")
-        result = whisper_model.transcribe(filename)
-        text = result["text"].strip()
-        full_text += f"{username}: {text}\n"
-        os.remove(filename)
-
-    if not full_text.strip():
-        await interaction.followup.send("⚠️ Пусто. Никто ничего не сказал.")
+@bot.command(name="record")
+async def record(ctx, duration: int = 10):
+    vc = ctx.voice_client
+    if not vc:
+        await ctx.send("❌ Бот не подключен к голосовому каналу.")
         return
 
-    await interaction.followup.send(f"📜 Расшифровка:\n```{full_text[:1900]}```")
+    audio_sink = discord.sinks.WaveSink()
+    vc.start_recording(
+        audio_sink,
+        once_done,
+        ctx.channel
+    )
+    await ctx.send(f"🎧 Начинаю запись на {duration} секунд...")
+    await asyncio.sleep(duration)
+    vc.stop_recording()
+
+async def once_done(sink: discord.sinks.WaveSink, channel: discord.TextChannel):
+    recorded_files = []
+
+    for user_id, audio in sink.audio_data.items():
+        try:
+            # Получаем имя пользователя
+            user = await channel.guild.fetch_member(user_id)
+            username = user.display_name if user else f"user_{user_id}"
+        except Exception:
+            username = f"user_{user_id}"
+
+        # Создаём путь и имя файла
+        filename = f"{username}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+        filepath = os.path.join("recordings", filename)
+
+        # Убеждаемся, что папка существует
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        try:
+            # Сохраняем WAV-файл с высоким качеством
+            with wave.open(filepath, "wb") as f:
+                f.setnchannels(2)          # Стерео
+                f.setsampwidth(2)          # 16 бит = 2 байта
+                f.setframerate(48000)      # 48kHz — стандарт Discord
+                f.writeframes(audio.file.getvalue())
+
+            recorded_files.append((user_id, filepath))
+            print(f"✅ Сохранено аудио: {filepath}")
+        except Exception as e:
+            await channel.send(f"❌ Ошибка при сохранении аудио от {username}: {e}")
+
+    if recorded_files:
+        await channel.send("📥 Обработка аудиофайлов...")
+        await process_audio_and_respond(channel, recorded_files)
+    else:
+        await channel.send("⚠️ Нет записанных аудиофайлов.")
+
+
+async def process_audio_and_respond(channel, files):
+    full_text = ""
+
+    for user_id, filepath in files:
+        username = await bot.fetch_user(user_id)
+        await channel.send(f"🔍 Распознаю голос {username}...")
+        result = whisper_model.transcribe(filepath)
+        text = result["text"].strip()
+        full_text += f"{username}: {text}\n"
+        os.remove(filepath)
+
+    if not full_text.strip():
+        await channel.send("⚠️ Никто ничего не сказал.")
+        return
+
+    await channel.send(f"📜 Расшифровка:\n```{full_text[:1900]}```")
 
     try:
         summary_input = "summarize: " + full_text
-        summary = summarizer(summary_input, max_length=100, min_length=30, do_sample=False)[0]['summary_text']
-        await interaction.followup.send(f"🧠 Сводка беседы:\n```{summary}```")
+        summary = summarizer(summary_input, max_length=100, min_length=30, do_sample=False)[0]["summary_text"]
+        await channel.send(f"🧠 Сводка:\n```{summary}```")
     except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка при создании сводки: {str(e)}")
+        await channel.send(f"❌ Ошибка суммирования: {str(e)}")
 
-# ====== /join ======
-@tree.command(name="join", description="Подключить бота к голосовому каналу", guild=discord.Object(id=GUILD_ID))
-async def join(interaction: discord.Interaction):
-    if interaction.user.voice:
-        channel = interaction.user.voice.channel
-        await channel.connect(cls=VoiceRecvClient)
-        await interaction.response.send_message("✅ Подключился к голосовому каналу.")
+@bot.command(name="leave")
+async def leave(ctx):
+    if ctx.voice_client:
+        await ctx.voice_client.disconnect()
+        await ctx.send("👋 Отключился от голосового канала.")
     else:
-        await interaction.response.send_message("❌ Ты не в голосовом канале.")
+        await ctx.send("❌ Бот не подключен к голосовому каналу.")
 
-# ====== /record ======
-@tree.command(name="record", description="Записать голосовой чат и сделать краткий итог", guild=discord.Object(id=GUILD_ID))
-async def record(interaction: discord.Interaction, duration: int = 10):
-    vc = interaction.guild.voice_client
-    if not vc or not isinstance(vc, VoiceRecvClient):
-        await interaction.response.send_message("❌ Сначала вызови /join.")
-        return
-
-    sink = RecordingSink()
-    vc.listen(sink)
-    await interaction.response.send_message(f"🎧 Запись началась на {duration} секунд...")
-    await asyncio.sleep(duration)
-    vc.stop_listening()
-    files = sink.save_to_wav()
-    await process_audio_and_respond(interaction, files)
-
-# ====== /leave ======
-@tree.command(name="leave", description="Отключить бота от голосового канала", guild=discord.Object(id=GUILD_ID))
-async def leave(interaction: discord.Interaction):
-    if interaction.guild.voice_client:
-        await interaction.guild.voice_client.disconnect()
-        await interaction.response.send_message("👋 Отключился.")
-    else:
-        await interaction.response.send_message("❌ Я не подключён.")
-
-# ====== СИНХРОНИЗАЦИЯ / КОМАНД ======
-@bot.event
-async def on_ready():
-    print(f"✅ Бот запущен: {bot.user}")
-    await bot.tree.sync()
-    print("✅ / команды обновлены")
-
-# ====== ЗАПУСК ======
-if __name__ == "__main__":
-    bot.run(TOKEN)
+bot.run(TOKEN)
