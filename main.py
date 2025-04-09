@@ -115,6 +115,8 @@ async def leave(interaction: discord.Interaction):
 async def on_ready():
     print(f"✅ Бот запущен: {bot.user}")
     await tree.sync(guild=discord.Object(id=GUILD_ID))
+    await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+    print("✅ / команды обновлены локально")
 
 # ====== ЗАПУСК ======
 if __name__ == "__main__":
