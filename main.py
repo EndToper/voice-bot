@@ -27,6 +27,45 @@ tree = bot.tree  # для slash-команд
 whisper_model = whisper.load_model("base")
 summarizer = pipeline("summarization", model="t5-small", tokenizer="t5-small")
 
+
+from discord.ext.voice_recv import AudioSink
+
+class RecordingSink(AudioSink):
+    def __init__(self):
+        self.audio_data = {}
+
+    def write(self, user, data):
+        if user.id not in self.audio_data:
+            self.audio_data[user.id] = {"name": user.display_name, "frames": []}
+        self.audio_data[user.id]["frames"].append(data)
+
+    def save_to_wav(self):
+        import os, wave
+        from datetime import datetime
+
+        os.makedirs("recordings", exist_ok=True)
+        files = []
+        for uid, info in self.audio_data.items():
+            frames = b"".join(info["frames"])
+            filename = f"recordings/{info['name']}_{uid}_{datetime.now().strftime('%H%M%S')}.wav"
+            with wave.open(filename, "wb") as wf:
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(48000)
+                wf.writeframes(frames)
+            files.append((info['name'], filename))
+        return files
+
+    # 🚨 Обязательные методы
+    def wants_opus(self) -> bool:
+        # Мы хотим PCM, а не Opus, чтобы Whisper мог обрабатывать
+        return False
+
+    def cleanup(self):
+        # Если нужно что-то убрать после stop_listening — сюда
+        pass
+
+
 # ====== СИНК ДЛЯ ЗАПИСИ ======
 class RecordingSink(AudioSink):
     def __init__(self):
@@ -114,9 +153,8 @@ async def leave(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     print(f"✅ Бот запущен: {bot.user}")
-    await tree.sync(guild=discord.Object(id=GUILD_ID))
-    await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
-    print("✅ / команды обновлены локально")
+    await bot.tree.sync()
+    print("✅ / команды обновлены")
 
 # ====== ЗАПУСК ======
 if __name__ == "__main__":
