@@ -37,7 +37,7 @@ class VoiceRecorderCog(discord.Cog):
         # Эфемерное состояние для работы с непрерывной записью (хранится только в памяти)
         self.continuous_recording = {}  # { "<guild_id>": bool }
         self.recording_loop_tasks = {}  # { "<guild_id>": asyncio.Task }
-        self.transcript_paths = {}  # { "<guild_id>": transcript_path }
+        self.transcript_paths = {}  # { "<guild_id>": transcript_file }
 
     def load_settings(self) -> dict:
         if os.path.exists(self.settings_file):
@@ -95,13 +95,14 @@ class VoiceRecorderCog(discord.Cog):
 
     async def on_recording_complete_once(self, sink: WaveSink, channel: discord.TextChannel):
         guild_id = str(channel.guild.id)
-        # Получаем настройки для сервера (если отсутствуют — значения по умолчанию)
+        # Получаем настройки для сервера (если отсутствуют – значения по умолчанию)
         settings = self.server_settings.get(guild_id,
                                             {"save_folder": "transcripts", "model_name": self.default_model_name})
         save_folder = settings.get("save_folder", "transcripts")
         os.makedirs(save_folder, exist_ok=True)
         transcript_file = os.path.join(save_folder, f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
 
+        transcript_entries = []  # Список кортежей (время, реплика)
         for user_id, audio in sink.audio_data.items():
             try:
                 filename = f"temp_{user_id}.wav"
@@ -121,19 +122,24 @@ class VoiceRecorderCog(discord.Cog):
                 os.remove(filename)
 
                 user = await self.bot.fetch_user(user_id)
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                text = f"[{timestamp}] {user.display_name}: {result['text'].strip()}\n"
+                # Захватываем время обработки (приблизительное время реплики)
+                current_time = datetime.now()
+                transcript_line = f"[{current_time.strftime('%H:%M:%S')}] {user.display_name}: {result['text'].strip()}"
+                transcript_entries.append((current_time, transcript_line))
+                print(f"📝 {transcript_line}")
 
-                with open(transcript_file, "a", encoding="utf-8") as f:
-                    f.write(text)
-
-                print(f"📝 {text.strip()}")
             except Exception as e:
                 await channel.send(f"❌ Ошибка при дешифровке: {e}")
 
+        # Сортируем записи по времени
+        transcript_entries.sort(key=lambda x: x[0])
+        with open(transcript_file, "a", encoding="utf-8") as f:
+            for _, line in transcript_entries:
+                f.write(line + "\n")
+
         await channel.send(f"✅ Запись завершена. Транскрипт сохранён в `{transcript_file}`")
 
-    @discord.slash_command(name="record_continuous", description="Начать непрерывную запись (5-минутными отрезками)")
+    @discord.slash_command(name="record_continuous", description="Начать непрерывную запись (30-секундными отрезками)")
     async def record_continuous(self, ctx: discord.ApplicationContext):
         guild_id = str(ctx.guild.id)
         vc = ctx.guild.voice_client
@@ -173,20 +179,19 @@ class VoiceRecorderCog(discord.Cog):
     async def recording_loop(self, ctx: discord.ApplicationContext, vc: discord.VoiceClient):
         guild_id = str(ctx.guild.id)
         while self.continuous_recording.get(guild_id, False) and vc and vc.is_connected():
-            # Если в голосовом канале нет неботовых участников, прекращаем запись
+            # Проверяем наличие неботовых участников в голосовом канале
             if not vc.channel.members or len([m for m in vc.channel.members if not m.bot]) == 0:
                 await ctx.followup.send("👥 Все покинули голосовой канал. Остановка записи.")
                 if vc.recording:
                     vc.stop_recording()
-                await ctx.guild.voice_client.disconnect()
                 break
 
             sink = WaveSink()
             vc.start_recording(sink, self.on_recording_complete, ctx.channel)
 
-            # Запись осуществляется 5 минут (300 секунд), но каждые 1 секунду проверяем участников
+            # Запись ведётся 30 секунд, с проверкой каждую секунду
             recording_interrupted = False
-            for i in range(300):  # 300 секунд = 5 минут
+            for i in range(30):
                 await asyncio.sleep(1)
                 if not vc.channel.members or len([m for m in vc.channel.members if not m.bot]) == 0:
                     await ctx.followup.send("👥 Все покинули голосовой канал во время записи. Остановка записи.")
@@ -195,15 +200,13 @@ class VoiceRecorderCog(discord.Cog):
                     recording_interrupted = True
                     break
             else:
-                # Если цикл завершился без прерывания, останавливаем запись по истечении 5 минут
                 if vc.recording:
                     vc.stop_recording()
 
-            # Если запись была прервана из-за отсутствия участников, выходим из цикла
             if recording_interrupted:
                 break
 
-            await asyncio.sleep(1)  # Небольшая задержка между отрезками
+            await asyncio.sleep(1)  # Задержка между отрезками
 
         self.continuous_recording[guild_id] = False
         await ctx.followup.send("✅ Непрерывная запись завершена.")
@@ -212,6 +215,7 @@ class VoiceRecorderCog(discord.Cog):
         guild_id = str(channel.guild.id)
         settings = self.server_settings.get(guild_id,
                                             {"save_folder": "transcripts", "model_name": self.default_model_name})
+        transcript_entries = []  # Список (время, реплика)
         for user_id, audio in sink.audio_data.items():
             try:
                 filename = f"temp_{user_id}.wav"
@@ -231,16 +235,20 @@ class VoiceRecorderCog(discord.Cog):
                 os.remove(filename)
 
                 user = await self.bot.fetch_user(user_id)
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                text = f"[{timestamp}] {user.display_name}: {result['text'].strip()}\n"
+                current_time = datetime.now()
+                transcript_line = f"[{current_time.strftime('%H:%M:%S')}] {user.display_name}: {result['text'].strip()}"
+                transcript_entries.append((current_time, transcript_line))
+                print(f"📝 {transcript_line}")
 
-                transcript_path = self.transcript_paths.get(guild_id, "transcript_default.txt")
-                with open(transcript_path, "a", encoding="utf-8") as f:
-                    f.write(text)
-
-                print(f"📝 {text.strip()}")
             except Exception as e:
                 await channel.send(f"❌ Ошибка при дешифровке: {e}")
+
+        # Сортируем записи по времени и дописываем их в файл
+        transcript_entries.sort(key=lambda x: x[0])
+        transcript_path = self.transcript_paths.get(guild_id, "transcript_default.txt")
+        with open(transcript_path, "a", encoding="utf-8") as f:
+            for _, line in transcript_entries:
+                f.write(line + "\n")
 
     @discord.slash_command(name="set_save_folder",
                            description="Установить папку для сохранения транскриптов для этого сервера")
@@ -253,10 +261,9 @@ class VoiceRecorderCog(discord.Cog):
         self.save_settings()
         await ctx.respond(f"✅ Папка для сохранения установлена в `{folder}` для этого сервера.")
 
-    AVAILABLE_MODELS = ["tiny", "base", "small", "medium", "large"]
     @discord.slash_command(name="set_transcription_model",
                            description="Установить модель для транскрипции для этого сервера")
-    async def set_transcription_model(self, ctx: discord.ApplicationContext, model_name: discord.Option(str, choices=AVAILABLE_MODELS)):
+    async def set_transcription_model(self, ctx: discord.ApplicationContext, model_name: str):
         guild_id = str(ctx.guild.id)
         settings = self.server_settings.get(guild_id,
                                             {"save_folder": "transcripts", "model_name": self.default_model_name})
@@ -271,7 +278,6 @@ class VoiceRecorderCog(discord.Cog):
             await ctx.followup.send(f"✅ Модель для транскрипции установлена в `{model_name}` для этого сервера.")
         else:
             await ctx.respond(f"✅ Модель для транскрипции установлена в `{model_name}` для этого сервера.")
-
 
 
 intents = discord.Intents.all()
