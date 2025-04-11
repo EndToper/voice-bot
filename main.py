@@ -13,6 +13,7 @@ import security
 
 TOKEN = security.token
 
+
 class VoiceRecorderCog(discord.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot
@@ -20,22 +21,23 @@ class VoiceRecorderCog(discord.Cog):
         # Определяем устройство для вычислений
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Предзагружаем модель по умолчанию и организуем кэш моделей
+        # Предзагружаем модель по умолчанию и кэш для остальных
         self.default_model_name = "medium"
         self.loaded_whisper_models = {}
-        self.loaded_whisper_models[self.default_model_name] = whisper.load_model(self.default_model_name, device=self.device)
+        self.loaded_whisper_models[self.default_model_name] = whisper.load_model(self.default_model_name,
+                                                                                 device=self.device)
 
-        # Загрузчик для суммаризации (если потребуется)
-        self.summarizer = pipeline("summarization", model="t5-small", device=0 if self.device=="cuda" else -1)
+        # Загрузчик суммаризации (если потребуется)
+        self.summarizer = pipeline("summarization", model="t5-small", device=0 if self.device == "cuda" else -1)
 
-        # Файл для сохранения настроек серверов и загрузка настроек
+        # Файл для хранения настроек серверов и их загрузка
         self.settings_file = "server_settings.json"
         self.server_settings = self.load_settings()  # Формат: { "<guild_id>": {"save_folder": ..., "model_name": ...} }
 
-        # Эфемерное состояние для работы с непрерывной записью (только в оперативной памяти)
-        self.continuous_recording = {}      # { "<guild_id>": bool }
-        self.recording_loop_tasks = {}      # { "<guild_id>": asyncio.Task }
-        self.transcript_paths = {}          # { "<guild_id>": transcript_path }
+        # Эфемерное состояние для работы с непрерывной записью (хранится только в памяти)
+        self.continuous_recording = {}  # { "<guild_id>": bool }
+        self.recording_loop_tasks = {}  # { "<guild_id>": asyncio.Task }
+        self.transcript_paths = {}  # { "<guild_id>": transcript_path }
 
     def load_settings(self) -> dict:
         if os.path.exists(self.settings_file):
@@ -74,8 +76,14 @@ class VoiceRecorderCog(discord.Cog):
     @discord.slash_command(name="record_once", description="Записать аудио на заданное количество секунд")
     async def record_once(self, ctx: discord.ApplicationContext, duration: int):
         vc = ctx.guild.voice_client
+        guild_id = str(ctx.guild.id)
         if not vc:
             await ctx.respond("❌ Бот не находится в голосовом канале. Используйте /join.")
+            return
+
+        # Проверка активной записи для данного сервера
+        if vc.recording or self.continuous_recording.get(guild_id, False):
+            await ctx.respond("⚠️ Запись уже идёт. Попробуйте позже.")
             return
 
         await ctx.respond(f"🎙 Идёт запись в течение {duration} секунд...")
@@ -87,8 +95,9 @@ class VoiceRecorderCog(discord.Cog):
 
     async def on_recording_complete_once(self, sink: WaveSink, channel: discord.TextChannel):
         guild_id = str(channel.guild.id)
-        # Получение настроек: если для сервера их нет, используем значения по умолчанию
-        settings = self.server_settings.get(guild_id, {"save_folder": "transcripts", "model_name": self.default_model_name})
+        # Получаем настройки для сервера (если отсутствуют — значения по умолчанию)
+        settings = self.server_settings.get(guild_id,
+                                            {"save_folder": "transcripts", "model_name": self.default_model_name})
         save_folder = settings.get("save_folder", "transcripts")
         os.makedirs(save_folder, exist_ok=True)
         transcript_file = os.path.join(save_folder, f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
@@ -124,7 +133,7 @@ class VoiceRecorderCog(discord.Cog):
 
         await channel.send(f"✅ Запись завершена. Транскрипт сохранён в `{transcript_file}`")
 
-    @discord.slash_command(name="record_continuous", description="Начать непрерывную запись (30-секундными отрезками)")
+    @discord.slash_command(name="record_continuous", description="Начать непрерывную запись (5-минутными отрезками)")
     async def record_continuous(self, ctx: discord.ApplicationContext):
         guild_id = str(ctx.guild.id)
         vc = ctx.guild.voice_client
@@ -132,14 +141,17 @@ class VoiceRecorderCog(discord.Cog):
             await ctx.respond("❌ Бот не находится в голосовом канале. Используйте /join.")
             return
 
-        if self.continuous_recording.get(guild_id, False):
+        # Проверка активной записи для данного сервера
+        if self.continuous_recording.get(guild_id, False) or vc.recording:
             await ctx.respond("⚠️ Запись уже идёт. Используйте /stop_recording чтобы остановить.")
             return
 
-        settings = self.server_settings.get(guild_id, {"save_folder": "transcripts", "model_name": self.default_model_name})
+        settings = self.server_settings.get(guild_id,
+                                            {"save_folder": "transcripts", "model_name": self.default_model_name})
         save_folder = settings.get("save_folder", "transcripts")
         os.makedirs(save_folder, exist_ok=True)
-        self.transcript_paths[guild_id] = os.path.join(save_folder, f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        self.transcript_paths[guild_id] = os.path.join(save_folder,
+                                                       f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
         self.continuous_recording[guild_id] = True
 
         await ctx.respond(f"🎙 Запись начата. Текст будет сохранён в `{self.transcript_paths[guild_id]}`")
@@ -153,28 +165,53 @@ class VoiceRecorderCog(discord.Cog):
             return
 
         self.continuous_recording[guild_id] = False
+        # Если бот ведёт запись, останавливаем её
+        if ctx.guild.voice_client and ctx.guild.voice_client.recording:
+            ctx.guild.voice_client.stop_recording()
         await ctx.respond("🛑 Запись остановлена.")
 
     async def recording_loop(self, ctx: discord.ApplicationContext, vc: discord.VoiceClient):
         guild_id = str(ctx.guild.id)
         while self.continuous_recording.get(guild_id, False) and vc and vc.is_connected():
+            # Если в голосовом канале нет неботовых участников, прекращаем запись
             if not vc.channel.members or len([m for m in vc.channel.members if not m.bot]) == 0:
                 await ctx.followup.send("👥 Все покинули голосовой канал. Остановка записи.")
+                if vc.recording:
+                    vc.stop_recording()
+                await ctx.guild.voice_client.disconnect()
                 break
 
             sink = WaveSink()
             vc.start_recording(sink, self.on_recording_complete, ctx.channel)
-            await asyncio.sleep(30)
-            if vc.recording:
-                vc.stop_recording()
-            await asyncio.sleep(1)
+
+            # Запись осуществляется 5 минут (300 секунд), но каждые 1 секунду проверяем участников
+            recording_interrupted = False
+            for i in range(300):  # 300 секунд = 5 минут
+                await asyncio.sleep(1)
+                if not vc.channel.members or len([m for m in vc.channel.members if not m.bot]) == 0:
+                    await ctx.followup.send("👥 Все покинули голосовой канал во время записи. Остановка записи.")
+                    if vc.recording:
+                        vc.stop_recording()
+                    recording_interrupted = True
+                    break
+            else:
+                # Если цикл завершился без прерывания, останавливаем запись по истечении 5 минут
+                if vc.recording:
+                    vc.stop_recording()
+
+            # Если запись была прервана из-за отсутствия участников, выходим из цикла
+            if recording_interrupted:
+                break
+
+            await asyncio.sleep(1)  # Небольшая задержка между отрезками
 
         self.continuous_recording[guild_id] = False
         await ctx.followup.send("✅ Непрерывная запись завершена.")
 
     async def on_recording_complete(self, sink: WaveSink, channel: discord.TextChannel):
         guild_id = str(channel.guild.id)
-        settings = self.server_settings.get(guild_id, {"save_folder": "transcripts", "model_name": self.default_model_name})
+        settings = self.server_settings.get(guild_id,
+                                            {"save_folder": "transcripts", "model_name": self.default_model_name})
         for user_id, audio in sink.audio_data.items():
             try:
                 filename = f"temp_{user_id}.wav"
@@ -205,19 +242,24 @@ class VoiceRecorderCog(discord.Cog):
             except Exception as e:
                 await channel.send(f"❌ Ошибка при дешифровке: {e}")
 
-    @discord.slash_command(name="set_save_folder", description="Установить папку для сохранения транскриптов для этого сервера")
+    @discord.slash_command(name="set_save_folder",
+                           description="Установить папку для сохранения транскриптов для этого сервера")
     async def set_save_folder(self, ctx: discord.ApplicationContext, folder: str):
         guild_id = str(ctx.guild.id)
-        settings = self.server_settings.get(guild_id, {"save_folder": "transcripts", "model_name": self.default_model_name})
+        settings = self.server_settings.get(guild_id,
+                                            {"save_folder": "transcripts", "model_name": self.default_model_name})
         settings["save_folder"] = folder
         self.server_settings[guild_id] = settings
         self.save_settings()
         await ctx.respond(f"✅ Папка для сохранения установлена в `{folder}` для этого сервера.")
 
-    @discord.slash_command(name="set_transcription_model", description="Установить модель для дешифровки (транскрипции) для этого сервера")
-    async def set_transcription_model(self, ctx: discord.ApplicationContext, model_name: str):
+    AVAILABLE_MODELS = ["tiny", "base", "small", "medium", "large"]
+    @discord.slash_command(name="set_transcription_model",
+                           description="Установить модель для транскрипции для этого сервера")
+    async def set_transcription_model(self, ctx: discord.ApplicationContext, model_name: discord.Option(str, choices=AVAILABLE_MODELS)):
         guild_id = str(ctx.guild.id)
-        settings = self.server_settings.get(guild_id, {"save_folder": "transcripts", "model_name": self.default_model_name})
+        settings = self.server_settings.get(guild_id,
+                                            {"save_folder": "transcripts", "model_name": self.default_model_name})
         settings["model_name"] = model_name
         self.server_settings[guild_id] = settings
         self.save_settings()
@@ -230,7 +272,8 @@ class VoiceRecorderCog(discord.Cog):
         else:
             await ctx.respond(f"✅ Модель для транскрипции установлена в `{model_name}` для этого сервера.")
 
-# Создаём инстанс бота и регистрируем Cog
+
+
 intents = discord.Intents.all()
 bot = discord.Bot(intents=intents)
 bot.add_cog(VoiceRecorderCog(bot))
